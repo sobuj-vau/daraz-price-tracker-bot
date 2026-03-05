@@ -172,7 +172,7 @@ class DarazScraper:
         "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
     }
     
-    @classmethod
+        @classmethod
     async def get_product_info(cls, url: str) -> Optional[ProductInfo]:
         """প্রোডাক্টের তথ্য সংগ্রহ"""
         try:
@@ -181,29 +181,36 @@ class DarazScraper:
             )
             response.raise_for_status()
             
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            title = cls._extract_title(soup)
-            if not title:
+            import json, re
+            # জাভাস্ক্রিপ্ট ডাটা থেকে তথ্য বের করা
+            match = re.search(r'app\.run\(({.*?})\);', response.text)
+            if not match:
                 return None
-            
-            current, original = cls._extract_prices(soup)
-            if not current:
+                
+            data = json.loads(match.group(1))
+            product_data = data.get('data', {}).get('root', {}).get('fields', {})
+            sku_data = product_data.get('skuInfos', {}).get('0', {})
+
+            title = product_data.get('product', {}).get('title')
+            current_price = float(sku_data.get('price', {}).get('salePrice', 0))
+            original_price = float(sku_data.get('price', {}).get('originalPrice', 0))
+            image = sku_data.get('image')
+
+            if not title or not current_price:
                 return None
-            
-            image = cls._extract_image(soup)
-            rating = cls._extract_rating(soup)
-            sold = cls._extract_sold_count(soup)
-            
+
             return ProductInfo(
                 url=url,
                 title=title,
-                current_price=current,
-                original_price=original,
-                image_url=image,
-                rating=rating,
-                sold_count=sold
+                current_price=current_price,
+                original_price=original_price if original_price > 0 else None,
+                image_url=image
             )
+
+        except Exception as e:
+            logger.error(f"স্ক্র্যাপিং এ সমস্যা: {e}")
+            return None
+
             
         except Exception as e:
             logger.error(f"স্ক্র্যাপিং এ সমস্যা: {e}")
