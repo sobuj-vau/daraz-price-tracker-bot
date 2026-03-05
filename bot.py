@@ -1,841 +1,742 @@
 import os
-import time
-import logging
-import asyncio
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any
-from dataclasses import dataclass
-from enum import Enum
-import hashlib
-from functools import wraps
-
 import requests
 import pymongo
+import asyncio
+import re
+import json
+import gzip
+from io import BytesIO
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, 
-    CallbackQueryHandler, filters, ContextTypes
-)
-from telegram.constants import ParseMode
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from datetime import datetime
+from bson.objectid import ObjectId
+from flask import Flask
+from threading import Thread
 
-# ========== কনফিগারেশন ==========
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # যেমন: @daraz_offers
-CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/daraz_offers")  # চ্যানেলের লিঙ্ক
+# --- সেটিংস (Render এ Environment Variables হিসেবে সেট করুন) ---
+TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-ADMIN_IDS = [int(id) for id in os.getenv("ADMIN_IDS", "").split(",") if id]
+CHECK_INTERVAL = 1800  # ৩০ মিনিট (সেকেন্ডে)
 
-# চেক করার ইন্টারভাল
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))  # মিনিট
-MIN_DISCOUNT_FOR_CHANNEL = int(os.getenv("MIN_DISCOUNT", "10"))  # চ্যানেলে পোস্টের জন্য ন্যূনতম ডিসকাউন্ট
+# MongoDB কানেকশন
+client = pymongo.MongoClient(MONGO_URI)
+db = client['daraz_tracker']
+tracks_collection = db['tracks']
+users_collection = db['users']
+stats_collection = db['stats']
 
-# ========== লগিং ==========
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
-# ========== MongoDB সেটআপ ==========
-try:
-    mongo_client = pymongo.MongoClient(MONGO_URI)
-    db = mongo_client['daraz_mandatory_bot']
+# ==============================================
+# দারাজ পার্সার ক্লাস (আপডেটেড)
+# ==============================================
+class DarazParser:
+    """শুধু দারাজের জন্য পার্সার - ব্রাউজার ইমুলেশন সহ"""
     
-    # কালেকশনসমূহ
-    users_collection = db['users']  # ইউজার তথ্য (চ্যানেল জয়েন স্ট্যাটাস সহ)
-    products_collection = db['products']  # সব প্রোডাক্ট
-    user_tracks_collection = db['user_tracks']  # ইউজারদের ট্র্যাক
-    channel_posts_collection = db['channel_posts']  # চ্যানেলে পোস্ট করা অফার
-    stats_collection = db['stats']  # পরিসংখ্যান
+    @staticmethod
+    def get_price(url):
+        """দারাজ থেকে প্রাইস সংগ্রহ করুন"""
+        
+        # রিয়েল ব্রাউজারের মতো হেডার
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+        
+        try:
+            # টাইমআউট বাড়ানো হয়েছে
+            response = requests.get(url, headers=headers, timeout=15)
+            
+            # gzip ডিকোড করা
+            if response.headers.get('content-encoding') == 'gzip':
+                response_content = gzip.decompress(response.content)
+                soup = BeautifulSoup(response_content, 'html.parser')
+            else:
+                soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # ========== প্রাইস সিলেক্টর ==========
+            price_selectors = [
+                # নতুন দারাজ ক্লাস
+                ('span', {'class': 'pdp-price'}),
+                ('span', {'class': 'pdp-price pdp-price--normal'}),
+                ('span', {'class': 'pdp-price pdp-price--discount'}),
+                ('div', {'class': 'pdp-product-price'}),
+                ('span', {'class': 'not-module-price'}),
+                
+                # পুরনো ক্লাস
+                ('span', {'class': 'sku-price'}),
+                ('span', {'class': 'pdp-price_range'}),
+                
+                # আইডি বেসড
+                ('div', {'id': 'module_product_price_1'}),
+                ('span', {'id': 'module-currency'}),
+            ]
+            
+            # প্রতিটি সিলেক্টর চেক করুন
+            for tag, attrs in price_selectors:
+                element = soup.find(tag, attrs)
+                if element:
+                    price_text = element.get_text()
+                    price = DarazParser._clean_price(price_text)
+                    if price and price > 0:
+                        return price
+            
+            # ========== স্ক্রিপ্ট ট্যাগ থেকে JSON ডাটা ==========
+            scripts = soup.find_all('script')
+            for script in scripts:
+                if script.string and 'window.runParams' in script.string:
+                    # window.runParams থেকে প্রাইস বের করা
+                    match = re.search(r'"price":\s*"?(\d+\.?\d*)"?', script.string)
+                    if match:
+                        return float(match.group(1))
+                    
+                    # sku info থেকে প্রাইস
+                    match = re.search(r'"skuId":.*?"price":\s*"?(\d+\.?\d*)"?', script.string)
+                    if match:
+                        return float(match.group(1))
+            
+            # ========== JSON-LD স্ক্রিপ্ট ==========
+            json_scripts = soup.find_all('script', type='application/ld+json')
+            for script in json_scripts:
+                if script.string:
+                    try:
+                        data = json.loads(script.string)
+                        if 'offers' in data and 'price' in data['offers']:
+                            return float(data['offers']['price'])
+                        elif 'price' in data:
+                            return float(data['price'])
+                    except:
+                        pass
+            
+            # ========== মেটা ট্যাগ ==========
+            meta_selectors = [
+                {'property': 'product:price:amount'},
+                {'name': 'price'},
+                {'itemprop': 'price'},
+                {'property': 'og:price:amount'},
+            ]
+            
+            for attrs in meta_selectors:
+                meta = soup.find('meta', attrs=attrs)
+                if meta and meta.get('content'):
+                    price = DarazParser._clean_price(meta['content'])
+                    if price:
+                        return price
+            
+            return None
+            
+        except requests.exceptions.Timeout:
+            print(f"[{datetime.now()}] টাইমআউট: দারাজ রেসপন্স দিচ্ছে না")
+            return None
+        except Exception as e:
+            print(f"[{datetime.now()}] দারাজ প্রাইস পার্সিং এ সমস্যা: {e}")
+            return None
     
-    # ইনডেক্স
-    users_collection.create_index("user_id", unique=True)
-    users_collection.create_index("channel_joined")
-    products_collection.create_index("url", unique=True)
-    user_tracks_collection.create_index([("user_id", 1), ("url", 1)], unique=True)
+    @staticmethod
+    def get_product_info(url):
+        """পণ্যের তথ্য সংগ্রহ করুন (নাম, আইডি)"""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # ========== পণ্যের নাম ==========
+            title = None
+            title_selectors = [
+                ('h1', {'class': 'pdp-product-title'}),
+                ('h1', {'class': 'pdp-mod-product-badge-title'}),
+                ('span', {'class': 'pdp-mod-product-badge-title'}),
+                ('h1', {'data-spm': '1001777'}),
+            ]
+            
+            for tag, attrs in title_selectors:
+                elem = soup.find(tag, attrs)
+                if elem:
+                    title = elem.get_text().strip()
+                    break
+            
+            # টাইটেল ট্যাগ থেকে
+            if not title:
+                title_tag = soup.find('title')
+                if title_tag:
+                    title = title_tag.get_text().strip()
+                    # "Price in Bangladesh" ইত্যাদি বাদ দেওয়া
+                    title = re.sub(r'\s*[-|].*$', '', title)
+            
+            # ========== প্রোডাক্ট আইডি ==========
+            product_id = None
+            id_match = re.search(r'i(\d+)', url)
+            if id_match:
+                product_id = id_match.group(1)
+            
+            return {
+                'title': title if title and len(title) > 5 else 'নাম জানা যায়নি',
+                'product_id': product_id,
+                'url': url
+            }
+            
+        except Exception as e:
+            print(f"[{datetime.now()}] পণ্যের তথ্য পাওয়া যায়নি: {e}")
+            return {'title': 'নাম জানা যায়নি', 'product_id': None, 'url': url}
     
-    logger.info("✅ MongoDB সংযোগ সফল")
-except Exception as e:
-    logger.error(f"❌ MongoDB সংযোগ ব্যর্থ: {e}")
-    raise
+    @staticmethod
+    def _clean_price(text):
+        """প্রাইস টেক্সট ক্লিন করুন"""
+        if not text:
+            return None
+        
+        # বাংলা সংখ্যা ইংরেজিতে রূপান্তর
+        bn_digits = {'০':'0', '১':'1', '২':'2', '৩':'3', '৪':'4', 
+                     '৫':'5', '৬':'6', '৭':'7', '৮':'8', '৯':'9'}
+        for bn, en in bn_digits.items():
+            text = text.replace(bn, en)
+        
+        # ৳, টাকা, কমা, স্পেস রিমুভ
+        text = re.sub(r'[^\d.]', ' ', text)
+        
+        # সব সংখ্যা বের করা
+        numbers = re.findall(r'\d+\.?\d*', text)
+        
+        # ভ্যালিড প্রাইস ফিল্টার (১০ টাকা - ১০ লাখ টাকা)
+        valid_prices = []
+        for num in numbers:
+            try:
+                price = float(num)
+                if 10 < price < 1000000:
+                    valid_prices.append(price)
+            except:
+                pass
+        
+        if valid_prices:
+            return max(valid_prices)  # সবচেয়ে বড় প্রাইস নেওয়া
+        
+        return None
 
-# ========== ডেকোরেটর: চ্যানেল চেক ==========
-async def check_channel_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """ইউজার চ্যানেলে জয়েন করেছে কিনা চেক করে"""
-    try:
-        # প্রথমে ডাটাবেসে চেক
-        user = users_collection.find_one({"user_id": user_id})
-        if user and user.get("channel_joined") == True:
-            # ৭ দিন পর পর রিফ্রেশ করুন
-            last_check = user.get("last_channel_check", datetime.min)
-            if datetime.utcnow() - last_check < timedelta(days=7):
-                return True
+
+# ==============================================
+# দারাজ বট ক্লাস
+# ==============================================
+class DarazBot:
+    def __init__(self):
+        self.parser = DarazParser()
+        self.bot_name = "দারাজ প্রাইস ট্র্যাকার 🇧🇩"
         
-        # টেলিগ্রাম API দিয়ে চেক
-        chat_member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        # মেইন কীবোর্ড
+        self.main_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 আমার ট্র্যাকিং", callback_data='list')],
+            [InlineKeyboardButton("➕ নতুন ট্র্যাক", callback_data='add')],
+            [InlineKeyboardButton("ℹ️ সাহায্য", callback_data='help')],
+            [InlineKeyboardButton("📊 পরিসংখ্যান", callback_data='stats')]
+        ])
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """স্টার্ট কমান্ড"""
+        user = update.effective_user
         
-        is_member = chat_member.status in ['member', 'administrator', 'creator']
-        
-        # ডাটাবেস আপডেট
+        # ইউজার ইনফো সেভ
         users_collection.update_one(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "channel_joined": is_member,
-                    "last_channel_check": datetime.utcnow()
-                }
-            },
+            {'user_id': user.id},
+            {'$set': {
+                'username': user.username,
+                'first_name': user.first_name,
+                'last_active': datetime.now(),
+                'total_tracks': tracks_collection.count_documents({'user_id': user.id})
+            }},
             upsert=True
         )
         
-        return is_member
+        welcome_text = (
+            f"👋 **স্বাগতম {user.first_name}!**\n\n"
+            "আমি **দারাজ প্রাইস ট্র্যাকার বট** - আপনার পছন্দের পণ্যের দাম কমলে জানিয়ে দেব।\n\n"
+            "**📝 কিভাবে ব্যবহার করবেন:**\n"
+            "1️⃣ দারাজ থেকে পণ্যের লিঙ্ক কপি করুন\n"
+            "2️⃣ বটে লিঙ্ক ও কাঙ্ক্ষিত দাম দিন\n"
+            "3️⃣ দাম কমলে নোটিফিকেশন পাবেন\n\n"
+            "**উদাহরণ:**\n"
+            "`https://www.daraz.com.bd/products/example-i123456789.html 1500`\n\n"
+            "**কমান্ড সমূহ:**\n"
+            "/mytracks - আপনার ট্র্যাক করা পণ্য\n"
+            "/help - সাহায্য\n"
+            "/stats - পরিসংখ্যান\n\n"
+            "নিচের বাটন ব্যবহার করুন 👇"
+        )
         
-    except Exception as e:
-        logger.error(f"চ্যানেল মেম্বারশিপ চেক করতে সমস্যা: {e}")
-        # এরর হলে False রিটার্ন করবেন না, বরং সতর্কতা সহ True দিন
-        # কারণ টেলিগ্রাম API মাঝে মাঝে এরর দিতে পারে
-        logger.warning("চ্যানেল চেক করতে সমস্যা, অ্যাক্সেস দেয়া হচ্ছে")
-        return True
-
-def require_channel(func):
-    """ডেকোরেটর - ফাংশন ব্যবহারের আগে চ্যানেল জয়েন চেক করে"""
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user_id = update.effective_user.id
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=self.main_keyboard
+        )
+    
+    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """বাটন ক্লিক হ্যান্ডলার"""
+        query = update.callback_query
+        await query.answer()
         
-        # চ্যানেল মেম্বারশিপ চেক
-        is_member = await check_channel_membership(user_id, context)
-        
-        if not is_member:
-            # চ্যানেল জয়েনের মেসেজ
-            msg = (
-                "⚠️ <b>চ্যানেল জয়েন করা আবশ্যক!</b>\n\n"
-                f"আমাদের চ্যানেল <b>{CHANNEL_ID}</b> এ জয়েন করুন, তারপর আবার চেষ্টা করুন।\n\n"
-                "🔰 চ্যানেল জয়েন করলে /start দিয়ে আবার শুরু করুন।"
+        if query.data == 'list':
+            await self.list_tracks(update, context)
+        elif query.data == 'add':
+            await query.edit_message_text(
+                "🔍 **নতুন পণ্য ট্র্যাক করুন**\n\n"
+                "একটি মেসেজে পাঠান:\n"
+                "`<দারাজ লিঙ্ক> <কাঙ্ক্ষিত দাম>`\n\n"
+                "**উদাহরণ:**\n"
+                "`https://www.daraz.com.bd/products/smartphone-i123456789.html 1500`\n\n"
+                "**নিয়ম:**\n"
+                "• শুধু দারাজের লিঙ্ক দিন\n"
+                "• দাম সংখ্যায় দিন (যেমন: 1500)\n"
+                "• প্রতি ইউজার সর্বোচ্চ ১০টি পণ্য ট্র্যাক করতে পারবেন",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 ব্যাক", callback_data='back_to_main')
+                ]])
             )
+        elif query.data == 'help':
+            await self.help(update, context)
+        elif query.data == 'stats':
+            await self.stats(update, context)
+        elif query.data == 'back_to_main':
+            await query.edit_message_text(
+                "🏠 **মেনুতে ফিরে আসুন**\n\nনিচের বাটন ব্যবহার করুন:",
+                reply_markup=self.main_keyboard
+            )
+        elif query.data.startswith('remove_'):
+            track_id = query.data.replace('remove_', '')
+            result = tracks_collection.delete_one({'_id': ObjectId(track_id)})
             
-            keyboard = [
-                [InlineKeyboardButton("📢 চ্যানেল জয়েন করুন", url=CHANNEL_LINK)],
-                [InlineKeyboardButton("✅ জয়েন করেছি", callback_data="check_join")]
-            ]
-            
-            if update.callback_query:
-                await update.callback_query.message.reply_text(
-                    msg, 
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(keyboard)
+            if result.deleted_count > 0:
+                await query.edit_message_text(
+                    "✅ **ট্র্যাকটি মুছে ফেলা হয়েছে!**",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 আমার ট্র্যাকিং", callback_data='list')
+                    ]])
                 )
             else:
+                await query.edit_message_text(
+                    "❌ **ট্র্যাকটি পাওয়া যায়নি!**",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 আমার ট্র্যাকিং", callback_data='list')
+                    ]])
+                )
+    
+    async def add_track(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """নতুন ট্র্যাক যোগ করুন"""
+        try:
+            text = update.message.text.strip()
+            parts = text.split()
+            
+            if len(parts) < 2:
                 await update.message.reply_text(
-                    msg, 
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(keyboard)
+                    "❌ **ভুল ফরম্যাট!**\n\n"
+                    "সঠিক ফরম্যাট: `<লিঙ্ক> <টার্গেট প্রাইস>`\n"
+                    "উদাহরণ: `https://www.daraz.com.bd/products/1234 1500`",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 মেনুতে ফিরুন", callback_data='back_to_main')
+                    ]])
                 )
-            return
-        
-        # চ্যানেল জয়েন করলে মূল ফাংশন কল
-        return await func(update, context, *args, **kwargs)
-    return wrapper
-
-# ========== ডাটাক্লাস ==========
-@dataclass
-class ProductInfo:
-    """প্রোডাক্ট তথ্য"""
-    url: str
-    title: str
-    current_price: float
-    original_price: Optional[float] = None
-    discount: int = 0
-    image_url: Optional[str] = None
-    rating: Optional[float] = None
-    sold_count: Optional[int] = None
-    
-    @property
-    def discount_percentage(self) -> int:
-        if self.original_price and self.original_price > self.current_price:
-            return round(((self.original_price - self.current_price) / self.original_price) * 100)
-        return 0
-    
-    @property
-    def product_hash(self) -> str:
-        """প্রোডাক্ট ইউনিক আইডি"""
-        return hashlib.md5(self.url.encode()).hexdigest()[:10]
-
-# ========== ডারাজ স্ক্র্যাপার ==========
-class DarazScraper:
-    """ডারাজ থেকে প্রোডাক্ট তথ্য সংগ্রহ"""
-    
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
-        "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
-    }
-    
-        @classmethod
-    async def get_product_info(cls, url: str) -> Optional[ProductInfo]:
-        """প্রোডাক্টের তথ্য সংগ্রহ"""
-        try:
-            response = await asyncio.to_thread(
-                requests.get, url, headers=cls.HEADERS, timeout=15
-            )
-            response.raise_for_status()
+                return
             
-            import json, re
-            # জাভাস্ক্রিপ্ট ডাটা থেকে তথ্য বের করা
-            match = re.search(r'app\.run\(({.*?})\);', response.text)
-            if not match:
-                return None
-                
-            data = json.loads(match.group(1))
-            product_data = data.get('data', {}).get('root', {}).get('fields', {})
-            sku_data = product_data.get('skuInfos', {}).get('0', {})
-
-            title = product_data.get('product', {}).get('title')
-            current_price = float(sku_data.get('price', {}).get('salePrice', 0))
-            original_price = float(sku_data.get('price', {}).get('originalPrice', 0))
-            image = sku_data.get('image')
-
-            if not title or not current_price:
-                return None
-
-            return ProductInfo(
-                url=url,
-                title=title,
-                current_price=current_price,
-                original_price=original_price if original_price > 0 else None,
-                image_url=image
-            )
-
-        except Exception as e:
-            logger.error(f"স্ক্র্যাপিং এ সমস্যা: {e}")
-            return None
-
+            url = parts[0]
+            target_price = float(parts[1])
+            user_id = update.effective_user.id
             
-        except Exception as e:
-            logger.error(f"স্ক্র্যাপিং এ সমস্যা: {e}")
-            return None
-    
-    @staticmethod
-    def _extract_title(soup):
-        selectors = [
-            "h1.pdp-mod-product-badge-title",
-            "h1.pdp-product-title",
-            "[data-testid='product-title']"
-        ]
-        for sel in selectors:
-            tag = soup.select_one(sel)
-            if tag:
-                return tag.text.strip()[:150]
-        return None
-    
-    @staticmethod
-    def _extract_prices(soup):
-        current = None
-        original = None
-        
-        price_selectors = [
-            "span.pdp-price",
-            ".pdp-product-price span",
-            "[data-testid='price']"
-        ]
-        for sel in price_selectors:
-            tag = soup.select_one(sel)
-            if tag:
-                try:
-                    text = tag.text.strip()
-                    current = float(text.replace('৳', '').replace(',', '').replace('BDT', '').strip())
-                    break
-                except:
-                    continue
-        
-        original_selectors = [
-            "span.pdp-price-original",
-            ".original-price",
-            "[data-testid='original-price']"
-        ]
-        for sel in original_selectors:
-            tag = soup.select_one(sel)
-            if tag:
-                try:
-                    original = float(tag.text.replace('৳', '').replace(',', '').strip())
-                    break
-                except:
-                    continue
-        
-        return current, original
-    
-    @staticmethod
-    def _extract_image(soup):
-        selectors = [
-            "img.pdp-mod-common-image",
-            ".gallery-preview-panel img",
-            "[data-testid='product-image']"
-        ]
-        for sel in selectors:
-            img = soup.select_one(sel)
-            if img and img.get('src'):
-                url = img['src']
-                if url.startswith('//'):
-                    url = 'https:' + url
-                return url
-        return None
-    
-    @staticmethod
-    def _extract_rating(soup):
-        selectors = [".pdp-review-summary-average", "[data-testid='rating']"]
-        for sel in selectors:
-            tag = soup.select_one(sel)
-            if tag:
-                try:
-                    return float(tag.text.strip())
-                except:
-                    continue
-        return None
-    
-    @staticmethod
-    def _extract_sold_count(soup):
-        selectors = [".sale-count", "[data-testid='sold']"]
-        for sel in selectors:
-            tag = soup.select_one(sel)
-            if tag:
-                text = tag.text.strip()
-                nums = ''.join(filter(str.isdigit, text))
-                return int(nums) if nums else None
-        return None
-
-# ========== নোটিফিকেশন ম্যানেজার ==========
-class NotificationManager:
-    """ইউজার ও চ্যানেলের জন্য নোটিফিকেশন"""
-    
-    @staticmethod
-    async def notify_users(context: ContextTypes.DEFAULT_TYPE, product: ProductInfo):
-        """যেসব ইউজার প্রোডাক্ট ট্র্যাক করছে তাদের নোটিফাই করা"""
-        tracks = user_tracks_collection.find({
-            "url": product.url,
-            "notified": False,
-            "target_price": {"$gte": product.current_price}
-        })
-        
-        notified_count = 0
-        for track in tracks:
-            try:
-                # ইউজার চ্যানেলে আছে কিনা চেক করুন (নোটিফিকেশন দেওয়ার আগেও)
-                is_member = await check_channel_membership(track['user_id'], context)
-                if not is_member:
-                    continue  # চ্যানেলে না থাকলে নোটিফিকেশন দেবেন না
-                
-                message = (
-                    f"🎉 <b>আপনার ট্র্যাক করা প্রোডাক্টের দাম কমেছে!</b>\n\n"
-                    f"📦 <b>{product.title}</b>\n"
-                    f"💰 <b>বর্তমান দাম:</b> ৳{product.current_price:,.2f}\n"
-                    f"📉 <b>ডিসকাউন্ট:</b> {product.discount_percentage}%\n"
-                    f"🎯 <b>আপনার টার্গেট:</b> ৳{track['target_price']:,.2f}\n\n"
-                    f"👉 <a href='{product.url}'>প্রোডাক্ট দেখুন</a>"
+            # দারাজ লিঙ্ক ভেরিফিকেশন
+            if 'daraz' not in url.lower():
+                await update.message.reply_text(
+                    "❌ **শুধু দারাজের লিঙ্ক দিন!**\n"
+                    "উদাহরণ: daraz.com.bd/products/..."
                 )
-                
-                await context.bot.send_message(
-                    chat_id=track['user_id'],
-                    text=message,
-                    parse_mode=ParseMode.HTML
-                )
-                
-                user_tracks_collection.update_one(
-                    {"_id": track["_id"]},
-                    {"$set": {"notified": True, "notified_at": datetime.utcnow()}}
-                )
-                
-                notified_count += 1
-                await asyncio.sleep(0.5)
-                
-            except Exception as e:
-                logger.error(f"ইউজার নোটিফিকেশন ব্যর্থ: {e}")
-        
-        if notified_count:
-            logger.info(f"✅ {notified_count} জন ইউজারকে নোটিফাই করা হয়েছে")
-    
-    @staticmethod
-    async def post_to_channel(context: ContextTypes.DEFAULT_TYPE, product: ProductInfo):
-        """চ্যানেলে অফার পোস্ট করা"""
-        
-        already_posted = channel_posts_collection.find_one({
-            "product_url": product.url,
-            "posted_date": {"$gte": datetime.utcnow() - timedelta(days=7)}
-        })
-        
-        if already_posted:
-            return
-        
-        message = NotificationManager._create_channel_post(product)
-        
-        try:
-            if product.image_url:
-                await context.bot.send_photo(
-                    chat_id=CHANNEL_ID,
-                    photo=product.image_url,
-                    caption=message,
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=CHANNEL_ID,
-                    text=message,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False
-                )
+                return
             
-            channel_posts_collection.insert_one({
-                "product_url": product.url,
-                "product_title": product.title,
-                "price": product.current_price,
-                "discount": product.discount_percentage,
-                "posted_date": datetime.utcnow()
-            })
+            # ইউজারের ট্র্যাক লিমিট চেক (সর্বোচ্চ ১০টি)
+            user_tracks = tracks_collection.count_documents({'user_id': user_id})
+            if user_tracks >= 10:
+                await update.message.reply_text(
+                    "⚠️ **আপনি সর্বোচ্চ ১০টি পণ্য ট্র্যাক করতে পারবেন!**\n"
+                    "পুরনো ট্র্যাক মুছে নতুন করুন।",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📋 আমার ট্র্যাকিং", callback_data='list')
+                    ]])
+                )
+                return
             
+            # প্রাইস চেক করা হচ্ছে
+            status_msg = await update.message.reply_text("⏳ দারাজ থেকে তথ্য সংগ্রহ করা হচ্ছে...")
+            
+            # পণ্যের তথ্য ও প্রাইস সংগ্রহ
+            product_info = self.parser.get_product_info(url)
+            current_price = self.parser.get_price(url)
+            
+            # দ্বিতীয়বার চেষ্টা যদি প্রথমবার না পায়
+            if not current_price:
+                await asyncio.sleep(2)
+                current_price = self.parser.get_price(url)
+            
+            # ডাটাবেজে সেভ
+            track_data = {
+                'user_id': user_id,
+                'url': url,
+                'title': product_info['title'],
+                'product_id': product_info['product_id'],
+                'target_price': target_price,
+                'current_price': current_price,
+                'created_at': datetime.now(),
+                'last_checked': datetime.now(),
+                'notified': False,
+                'status': 'active'
+            }
+            tracks_collection.insert_one(track_data)
+            
+            # স্ট্যাটস আপডেট
             stats_collection.update_one(
-                {"type": "channel_posts"},
-                {"$inc": {"count": 1}},
+                {'date': datetime.now().strftime('%Y-%m-%d')},
+                {'$inc': {'total_tracks': 1}},
                 upsert=True
             )
             
-            logger.info(f"✅ চ্যানেলে পোস্ট করা হয়েছে: {product.title[:50]}")
+            # রেসপন্স তৈরি
+            if current_price:
+                response = f"✅ **ট্র্যাকিং শুরু হয়েছে!**\n\n"
+                response += f"📦 **পণ্য:** {product_info['title']}\n"
+                response += f"💰 **বর্তমান দাম:** ৳{current_price}\n"
+                response += f"🎯 **টার্গেট মূল্য:** ৳{target_price}\n"
+                
+                if current_price <= target_price:
+                    response += f"⚠️ **বর্তমান দাম ই আপনার টার্গেটের চেয়ে কম!**\n"
+            else:
+                response = f"⚠️ **প্রোডাক্ট তথ্য পাওয়া যায়নি!**\n\n"
+                response += f"📦 **পণ্য:** {product_info['title']}\n"
+                response += f"🎯 **টার্গেট:** ৳{target_price}\n\n"
+                response += f"আমি পরে আবার চেক করব। দাম কমলে জানাব!"
+            
+            await status_msg.edit_text(response)
+            
+        except ValueError:
+            await update.message.reply_text("❌ **দাম সঠিক সংখ্যা দিন!**\nউদাহরণ: 1500")
+        except Exception as e:
+            await update.message.reply_text(f"❌ **এরর হয়েছে:** {str(e)}")
+    
+    async def list_tracks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """ট্র্যাক লিস্ট দেখান"""
+        user_id = update.effective_user.id
+        
+        tracks = list(tracks_collection.find({'user_id': user_id}).sort('created_at', -1))
+        
+        if not tracks:
+            msg = "📭 **আপনার কোনো ট্র্যাক করা পণ্য নেই!**\n\nনতুন পণ্য ট্র্যাক করতে লিঙ্ক ও দাম পাঠান।"
+            if update.callback_query:
+                await update.callback_query.edit_message_text(
+                    msg,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("➕ নতুন ট্র্যাক", callback_data='add')
+                    ]])
+                )
+            else:
+                await update.message.reply_text(msg)
+            return
+        
+        msg = f"📋 **আপনার ট্র্যাক করা পণ্য ({len(tracks)}টি)**\n\n"
+        keyboard = []
+        
+        for i, track in enumerate(tracks, 1):
+            # স্ট্যাটাস ইমোজি
+            if track.get('notified'):
+                status = "✅ নোটিফাই করা হয়েছে"
+            elif track.get('current_price') and track['current_price'] <= track['target_price']:
+                status = "💰 টার্গেট অর্জিত"
+            else:
+                status = "⏳ ট্র্যাকিং চলছে"
+            
+            msg += f"**{i}. {track['title'][:50]}**\n"
+            msg += f"   🎯 টার্গেট: ৳{track['target_price']}\n"
+            msg += f"   💰 বর্তমান: ৳{track.get('current_price', 'অজানা')}\n"
+            msg += f"   📊 স্ট্যাটাস: {status}\n"
+            msg += f"   [🔗 লিঙ্ক]({track['url']})\n\n"
+            
+            # রিমুভ বাটন
+            keyboard.append([InlineKeyboardButton(
+                f"❌ মুছুন {i}", 
+                callback_data=f"remove_{track['_id']}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("🔙 মেনু", callback_data='back_to_main')])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                msg,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+        else:
+            await update.message.reply_text(
+                msg,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+    
+    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """হেল্প মেসেজ"""
+        help_text = (
+            "📚 **দারাজ প্রাইস ট্র্যাকার বট - সাহায্য**\n\n"
+            "**কমান্ড সমূহ:**\n"
+            "/start - বট শুরু করুন\n"
+            "/mytracks - আপনার ট্র্যাক করা পণ্য দেখুন\n"
+            "/help - এই মেসেজ\n"
+            "/stats - বট পরিসংখ্যান\n\n"
+            
+            "**কিভাবে ব্যবহার করবেন:**\n"
+            "1️⃣ দারাজ অ্যাপ বা ওয়েবসাইট থেকে পণ্যের লিঙ্ক কপি করুন\n"
+            "2️⃣ বটে লিঙ্ক এবং আপনার কাঙ্ক্ষিত দাম দিন\n"
+            "3️⃣ বট স্বয়ংক্রিয়ভাবে প্রতি ৩০ মিনিট পর প্রাইস চেক করবে\n"
+            "4️⃣ দাম কমলে আপনি নোটিফিকেশন পাবেন\n\n"
+            
+            "**উদাহরণ:**\n"
+            "`https://www.daraz.com.bd/products/smartphone-i123456789.html 1500`\n\n"
+            
+            "**নিয়ম:**\n"
+            "• শুধু দারাজের পণ্য ট্র্যাক করা যায়\n"
+            "• সর্বোচ্চ ১০টি পণ্য ট্র্যাক করতে পারবেন\n"
+            "• দাম বাংলা বা ইংরেজি সংখ্যা দুই-ই দেওয়া যাবে\n\n"
+            
+            "🔗 **আপডেট ও সাপোর্ট:** @YourChannel"
+        )
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                help_text,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 ব্যাক", callback_data='back_to_main')
+                ]])
+            )
+        else:
+            await update.message.reply_text(help_text)
+    
+    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """বট পরিসংখ্যান"""
+        total_users = users_collection.count_documents({})
+        total_tracks = tracks_collection.count_documents({})
+        active_tracks = tracks_collection.count_documents({'status': 'active'})
+        notified_tracks = tracks_collection.count_documents({'notified': True})
+        
+        # আজকের স্ট্যাটস
+        today = datetime.now().strftime('%Y-%m-%d')
+        today_stats = stats_collection.find_one({'date': today})
+        today_tracks = today_stats['total_tracks'] if today_stats else 0
+        
+        stats_text = (
+            f"📊 **দারাজ বট পরিসংখ্যান**\n\n"
+            f"👥 **মোট ইউজার:** {total_users}\n"
+            f"📦 **মোট ট্র্যাক:** {total_tracks}\n"
+            f"✅ **এক্টিভ ট্র্যাক:** {active_tracks}\n"
+            f"🎉 **নোটিফিকেশন:** {notified_tracks}\n"
+            f"📅 **আজকের ট্র্যাক:** {today_tracks}\n\n"
+            f"**বট ভার্সন:** 2.0 (শুধু দারাজ)\n"
+            f"**চেক ইন্টারভাল:** ৩০ মিনিট"
+        )
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                stats_text,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 ব্যাক", callback_data='back_to_main')
+                ]])
+            )
+        else:
+            await update.message.reply_text(stats_text)
+    
+    async def price_checker_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """JobQueue দিয়ে প্রাইস চেক করা"""
+        parser = DarazParser()
+        bot = context.bot
+        
+        print(f"\n[{datetime.now()}] 🔍 JobQueue: দারাজ প্রাইস চেক করা হচ্ছে...")
+        
+        try:
+            # সব এক্টিভ ট্র্যাক
+            active_tracks = tracks_collection.find({'notified': False})
+            checked = 0
+            notified = 0
+            
+            for track in active_tracks:
+                try:
+                    current_price = parser.get_price(track['url'])
+                    
+                    if current_price:
+                        # আপডেট প্রাইস
+                        tracks_collection.update_one(
+                            {'_id': track['_id']},
+                            {'$set': {
+                                'current_price': current_price,
+                                'last_checked': datetime.now()
+                            }}
+                        )
+                        
+                        # চেক টার্গেট প্রাইস
+                        if current_price <= track['target_price']:
+                            # নোটিফিকেশন পাঠান
+                            message = (
+                                f"🎉 **দাম কমেছে!**\n\n"
+                                f"📦 **পণ্য:** {track['title']}\n"
+                                f"💰 **বর্তমান দাম:** ৳{current_price}\n"
+                                f"🎯 **আপনার টার্গেট:** ৳{track['target_price']}\n"
+                                f"📉 **কমেছে:** ৳{track['target_price'] - current_price}\n\n"
+                                f"🔗 [পণ্যটি দেখুন]({track['url']})"
+                            )
+                            
+                            try:
+                                await bot.send_message(
+                                    chat_id=track['user_id'],
+                                    text=message,
+                                    parse_mode='Markdown'
+                                )
+                                
+                                # নোটিফাইড মার্ক করুন
+                                tracks_collection.update_one(
+                                    {'_id': track['_id']},
+                                    {'$set': {'notified': True}}
+                                )
+                                
+                                notified += 1
+                                
+                                # স্ট্যাটস আপডেট
+                                stats_collection.update_one(
+                                    {'date': datetime.now().strftime('%Y-%m-%d')},
+                                    {'$inc': {'notifications': 1}},
+                                    upsert=True
+                                )
+                                
+                            except Exception as e:
+                                print(f"নোটিফিকেশন পাঠাতে সমস্যা: {e}")
+                    
+                    checked += 1
+                    
+                except Exception as e:
+                    print(f"ট্র্যাক চেক করতে সমস্যা: {e}")
+                    continue
+            
+            print(f"✅ JobQueue চেক সম্পন্ন: {checked} টি চেক করা, {notified} টি নোটিফিকেশন পাঠানো হয়েছে")
             
         except Exception as e:
-            logger.error(f"চ্যানেল পোস্ট ব্যর্থ: {e}")
-    
-    @staticmethod
-    def _create_channel_post(product: ProductInfo) -> str:
-        """চ্যানেলের জন্য পোস্ট তৈরি"""
-        
-        if product.discount_percentage >= 50:
-            header = "🔥 <b>বাম্পার অফার!</b> 🔥"
-        elif product.discount_percentage >= 30:
-            header = "⚡️ <b>সুপার ডিল!</b> ⚡️"
-        else:
-            header = "🛍️ <b>নতুন অফার!</b>"
-        
-        message = f"{header}\n\n"
-        message += f"<b>📦 {product.title}</b>\n\n"
-        
-        if product.original_price and product.original_price > product.current_price:
-            message += f"<b>💵 মূল দাম:</b> <s>৳{product.original_price:,.2f}</s>\n"
-            message += f"<b>💰 বর্তমান দাম:</b> <code>৳{product.current_price:,.2f}</code>\n"
-            message += f"<b>📉 ডিসকাউন্ট:</b> <code>{product.discount_percentage}%</code>\n"
-        else:
-            message += f"<b>💰 দাম:</b> <code>৳{product.current_price:,.2f}</code>\n"
-        
-        if product.rating:
-            message += f"<b>⭐️ রেটিং:</b> {product.rating}/5\n"
-        if product.sold_count:
-            message += f"<b>👥 বিক্রি হয়েছে:</b> {product.sold_count}+\n"
-        
-        message += f"\n🔗 <a href='{product.url}'>দারাজে দেখুন</a>\n\n"
-        message += "<i>#daraz #offer #বাংলাদেশ #শপিং</i>"
-        
-        return message
+            print(f"❌ JobQueue প্রাইস চেকারে বড় সমস্যা: {e}")
 
-# ========== ব্যাকগ্রাউন্ড জব ==========
-async def price_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    """প্রাইস মনিটরিং"""
-    logger.info("🔄 প্রাইস চেক শুরু...")
+
+# ==============================================
+# ফ্লাস্ক সার্ভার (Render-এর জন্য)
+# ==============================================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "🤖 দারাজ প্রাইস ট্র্যাকার বট চলছে! 🇧🇩"
+
+def run():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run, daemon=True)
+    t.start()
+
+
+# ==============================================
+# প্রাইস চেকার ফাংশন (JobQueue-র জন্য)
+# ==============================================
+async def price_checker_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue দিয়ে প্রাইস চেক করা"""
+    parser = DarazParser()
+    bot = context.bot
+    
+    print(f"\n[{datetime.now()}] 🔍 প্রাইস চেক করা হচ্ছে...")
     
     try:
-        products = list(products_collection.find({}))
+        active_tracks = tracks_collection.find({'notified': False})
+        checked = 0
+        notified = 0
         
-        if not products:
-            logger.info("কোনো প্রোডাক্ট নেই")
-            return
-        
-        for product_data in products:
+        for track in active_tracks:
             try:
-                scraper = DarazScraper()
-                current_info = await scraper.get_product_info(product_data['url'])
+                current_price = parser.get_price(track['url'])
                 
-                if not current_info:
-                    continue
-                
-                old_price = product_data.get('last_price')
-                old_discount = product_data.get('last_discount', 0)
-                
-                price_decreased = old_price and current_info.current_price < old_price
-                discount_increased = current_info.discount_percentage > old_discount
-                
-                products_collection.update_one(
-                    {"_id": product_data["_id"]},
-                    {
-                        "$set": {
-                            "current_price": current_info.current_price,
-                            "original_price": current_info.original_price,
-                            "discount": current_info.discount_percentage,
-                            "last_checked": datetime.utcnow(),
-                            "last_price": current_info.current_price,
-                            "last_discount": current_info.discount_percentage,
-                            "title": current_info.title
-                        },
-                        "$inc": {"check_count": 1}
-                    }
-                )
-                
-                if price_decreased or discount_increased:
-                    logger.info(f"📉 দাম কমেছে: {current_info.title[:50]}")
+                if current_price:
+                    tracks_collection.update_one(
+                        {'_id': track['_id']},
+                        {'$set': {'current_price': current_price}}
+                    )
                     
-                    # ইউজারদের নোটিফাই
-                    await NotificationManager.notify_users(context, current_info)
-                    
-                    # চ্যানেলে পোস্ট
-                    if current_info.discount_percentage >= MIN_DISCOUNT_FOR_CHANNEL:
-                        await NotificationManager.post_to_channel(context, current_info)
+                    if current_price <= track['target_price']:
+                        message = (
+                            f"🎉 **দাম কমেছে!**\n\n"
+                            f"📦 **পণ্য:** {track['title']}\n"
+                            f"💰 **বর্তমান:** ৳{current_price}\n"
+                            f"🎯 **টার্গেট:** ৳{track['target_price']}"
+                        )
+                        
+                        await bot.send_message(
+                            chat_id=track['user_id'],
+                            text=message
+                        )
+                        
+                        tracks_collection.update_one(
+                            {'_id': track['_id']},
+                            {'$set': {'notified': True}}
+                        )
+                        
+                        notified += 1
                 
-                await asyncio.sleep(2)
+                checked += 1
                 
             except Exception as e:
-                logger.error(f"প্রোডাক্ট চেক করতে সমস্যা: {e}")
+                print(f"ট্র্যাক চেক করতে সমস্যা: {e}")
                 continue
         
-        logger.info("✅ প্রাইস চেক শেষ")
+        print(f"✅ চেক সম্পন্ন: {checked} টি চেক করা, {notified} টি নোটিফিকেশন")
         
     except Exception as e:
-        logger.error(f"মনিটরিং জবে সমস্যা: {e}")
+        print(f"❌ প্রাইস চেকারে সমস্যা: {e}")
 
-# ========== ইউজার কমান্ড (চ্যানেল চেক সহ) ==========
-@require_channel
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """স্টার্ট কমান্ড"""
-    user = update.effective_user
-    
-    # ইউজার আপডেট
-    users_collection.update_one(
-        {"user_id": user.id},
-        {
-            "$set": {
-                "username": user.username,
-                "first_name": user.first_name,
-                "last_active": datetime.utcnow(),
-                "channel_joined": True
-            }
-        },
-        upsert=True
-    )
-    
-    welcome_msg = (
-        f"👋 <b>স্বাগতম {user.first_name}!</b>\n\n"
-        f"আপনি সফলভাবে চ্যানেলে জয়েন করেছেন! 🎉\n\n"
-        f"আমি <b>দারাজ হাইব্রিড ট্র্যাকার বট</b>। আমি দুইটি কাজ করি:\n\n"
-        f"1️⃣ <b>পার্সোনাল ট্র্যাকিং:</b> আপনি প্রোডাক্ট লিঙ্ক ও টার্গেট প্রাইস দিন, দাম কমলে জানাব\n"
-        f"2️⃣ <b>চ্যানেল অটো-পোস্ট:</b> ভালো অফার পেলে চ্যানেলে পোস্ট করি\n\n"
-        f"📢 <b>আমাদের চ্যানেল:</b> {CHANNEL_ID}\n\n"
-        f"📌 <b>ব্যবহার করবেন যেভাবে:</b>\n"
-        f"প্রোডাক্টের লিঙ্ক ও আপনার টার্গেট প্রাইস দিন\n"
-        f"যেমন: <code>https://daraz.com.bd/product... 1500</code>"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("📢 চ্যানেল ভিজিট", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("📋 আমার ট্র্যাক", callback_data="my_tracks"),
-         InlineKeyboardButton("ℹ️ সাহায্য", callback_data="help")]
-    ]
-    
-    await update.message.reply_text(
-        welcome_msg,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
 
-@require_channel
-async def handle_track_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ইউজারের ট্র্যাক রিকোয়েস্ট"""
-    try:
-        text = update.message.text.strip()
-        parts = text.split()
-        
-        if len(parts) < 2:
-            await update.message.reply_text(
-                "❌ ভুল ফরম্যাট!\n"
-                "সঠিক ফরম্যাট: `<লিঙ্ক> <টার্গেট প্রাইস>`\n"
-                "উদাহরণ: `https://daraz.com.bd/product... 1500`"
-            )
-            return
-        
-        url = parts[0]
-        try:
-            target_price = float(parts[1])
-        except:
-            await update.message.reply_text("❌ টার্গেট প্রাইস সঠিক সংখ্যা দিন!")
-            return
-        
-        user_id = update.effective_user.id
-        
-        if 'daraz.com.bd' not in url and 'daraz.com' not in url:
-            await update.message.reply_text("❌ শুধু দারাজের লিঙ্ক দিন!")
-            return
-        
-        status_msg = await update.message.reply_text("⏳ প্রোডাক্ট তথ্য সংগ্রহ করা হচ্ছে...")
-        
-        scraper = DarazScraper()
-        product_info = await scraper.get_product_info(url)
-        
-        if not product_info:
-            await status_msg.edit_text("❌ প্রোডাক্ট তথ্য পাওয়া যায়নি!")
-            return
-        
-        # প্রোডাক্ট মাস্টার লিস্টে যোগ
-        products_collection.update_one(
-            {"url": url},
-            {
-                "$set": {
-                    "url": url,
-                    "title": product_info.title,
-                    "current_price": product_info.current_price,
-                    "original_price": product_info.original_price,
-                    "discount": product_info.discount_percentage,
-                    "last_checked": datetime.utcnow(),
-                    "last_price": product_info.current_price,
-                    "last_discount": product_info.discount_percentage
-                },
-                "$setOnInsert": {
-                    "first_seen": datetime.utcnow()
-                }
-            },
-            upsert=True
-        )
-        
-        # ইউজার ট্র্যাক যোগ
-        try:
-            user_tracks_collection.insert_one({
-                "user_id": user_id,
-                "url": url,
-                "target_price": target_price,
-                "notified": False,
-                "created_at": datetime.utcnow(),
-                "product_title": product_info.title,
-                "current_price_at_track": product_info.current_price
-            })
-            
-            msg = (
-                f"✅ <b>ট্র্যাকিং সেট হয়েছে!</b>\n\n"
-                f"📦 <b>{product_info.title}</b>\n"
-                f"💰 বর্তমান দাম: ৳{product_info.current_price:,.2f}\n"
-                f"🎯 আপনার টার্গেট: ৳{target_price:,.2f}\n"
-                f"📉 ডিসকাউন্ট: {product_info.discount_percentage}%\n\n"
-                f"যখন দাম ৳{target_price:,.2f} বা এর নিচে নামবে, আমি আপনাকে জানাব!"
-            )
-            
-            keyboard = [
-                [InlineKeyboardButton("📋 আমার ট্র্যাক লিস্ট", callback_data="my_tracks")],
-                [InlineKeyboardButton("📢 চ্যানেল দেখুন", url=CHANNEL_LINK)]
-            ]
-            
-            await status_msg.edit_text(
-                msg, 
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            
-        except pymongo.errors.DuplicateKeyError:
-            await status_msg.edit_text(
-                "⚠️ আপনি এই প্রোডাক্টটি আগেই ট্র্যাক করছেন!\n"
-                "আপনার ট্র্যাক লিস্ট দেখতে /mytracks ব্যবহার করুন।"
-            )
-        
-    except Exception as e:
-        logger.error(f"ট্র্যাক হ্যান্ডলিং এ সমস্যা: {e}")
-        await update.message.reply_text("❌ সমস্যা হয়েছে! আবার চেষ্টা করুন।")
-
-@require_channel
-async def my_tracks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ইউজারের ট্র্যাক লিস্ট"""
-    user_id = update.effective_user.id
-    
-    tracks = list(user_tracks_collection.find(
-        {"user_id": user_id}
-    ).sort("created_at", -1).limit(20))
-    
-    if not tracks:
-        await update.message.reply_text(
-            "📭 আপনি এখনো কোনো প্রোডাক্ট ট্র্যাক করছেন না।\n"
-            "একটি দারাজ লিঙ্ক ও টার্গেট প্রাইস দিন শুরু করতে।"
-        )
-        return
-    
-    msg = "<b>📋 আপনার ট্র্যাক করা প্রোডাক্ট:</b>\n\n"
-    
-    for i, track in enumerate(tracks, 1):
-        status = "✅ পৌঁছেছে" if track.get('notified') else "⏳ অপেক্ষমাণ"
-        msg += f"{i}. <b>{track.get('product_title', 'Unknown')[:50]}</b>\n"
-        msg += f"   🎯 টার্গেট: ৳{track['target_price']:,.2f} | {status}\n"
-        msg += f"   🔗 <a href='{track['url']}'>লিঙ্ক</a>\n\n"
-    
-    keyboard = [
-        [InlineKeyboardButton("🗑 সব মুছুন", callback_data="clear_my_tracks")],
-        [InlineKeyboardButton("📢 চ্যানেল দেখুন", url=CHANNEL_LINK)]
-    ]
-    
-    await update.message.reply_text(
-        msg,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        disable_web_page_preview=True
-    )
-
-# ========== কলব্যাক হ্যান্ডলার ==========
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """বাটন কলব্যাক"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "check_join":
-        user_id = update.effective_user.id
-        is_member = await check_channel_membership(user_id, context)
-        
-        if is_member:
-            await query.edit_message_text(
-                "✅ আপনি চ্যানেলে জয়েন করেছেন! এখন /start দিন আবার।",
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await query.edit_message_text(
-                "❌ আপনি এখনও চ্যানেলে জয়েন করেননি। দয়া করে জয়েন করুন।",
-                parse_mode=ParseMode.HTML
-            )
-    
-    elif query.data == "my_tracks":
-        await my_tracks_command(update, context)
-    
-    elif query.data == "clear_my_tracks":
-        user_id = update.effective_user.id
-        result = user_tracks_collection.delete_many({"user_id": user_id})
-        await query.edit_message_text(f"✅ {result.deleted_count} টি ট্র্যাক মুছে ফেলা হয়েছে।")
-    
-    elif query.data == "help":
-        help_text = (
-            "<b>ℹ️ সাহায্য ও নির্দেশিকা</b>\n\n"
-            "<b>🔹 প্রোডাক্ট ট্র্যাক করবেন যেভাবে:</b>\n"
-            "দারাজ লিঙ্ক ও টার্গেট প্রাইস দিন\n"
-            "উদাহরণ: <code>https://daraz.com.bd/product... 1500</code>\n\n"
-            "<b>🔹 কমান্ড সমূহ:</b>\n"
-            "/start - বট শুরু\n"
-            "/mytracks - আপনার ট্র্যাক লিস্ট\n\n"
-            "<b>🔹 নোটিশ:</b>\n"
-            "• বট ব্যবহার করতে চ্যানেল জয়েন করা আবশ্যক\n"
-            "• প্রতি ৩০ মিনিট পর দাম চেক করা হয়\n"
-            "• দাম কমলে আপনি নোটিফিকেশন পাবেন\n"
-            "• ভালো অফার চ্যানেলেও পোস্ট করা হয়"
-        )
-        await query.edit_message_text(help_text, parse_mode=ParseMode.HTML)
-
-# ========== অ্যাডমিন কমান্ড ==========
-async def admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """অ্যাডমিন প্রোডাক্ট যোগ"""
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    
-    try:
-        url = context.args[0] if context.args else None
-        if not url:
-            await update.message.reply_text("ইউআরএল দিন: /add https://daraz.com...")
-            return
-        
-        msg = await update.message.reply_text("⏳ যোগ করা হচ্ছে...")
-        
-        scraper = DarazScraper()
-        product = await scraper.get_product_info(url)
-        
-        if not product:
-            await msg.edit_text("❌ তথ্য পাওয়া যায়নি!")
-            return
-        
-        products_collection.update_one(
-            {"url": url},
-            {
-                "$set": {
-                    "url": url,
-                    "title": product.title,
-                    "current_price": product.current_price,
-                    "original_price": product.original_price,
-                    "discount": product.discount_percentage,
-                    "added_by": update.effective_user.id,
-                    "added_at": datetime.utcnow(),
-                    "last_checked": datetime.utcnow()
-                }
-            },
-            upsert=True
-        )
-        
-        await msg.edit_text(f"✅ যোগ করা হয়েছে!\n{product.title[:100]}")
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ সমস্যা: {e}")
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """পরিসংখ্যান"""
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    
-    total_products = products_collection.count_documents({})
-    total_users = users_collection.count_documents({})
-    total_tracks = user_tracks_collection.count_documents({})
-    total_channel_posts = channel_posts_collection.count_documents({})
-    active_tracks = user_tracks_collection.count_documents({"notified": False})
-    
-    # চ্যানেল জয়েন করা ইউজার
-    channel_users = users_collection.count_documents({"channel_joined": True})
-    
-    msg = (
-        f"<b>📊 বট পরিসংখ্যান</b>\n\n"
-        f"📦 মোট প্রোডাক্ট: {total_products}\n"
-        f"👥 মোট ইউজার: {total_users}\n"
-        f"✅ চ্যানেল জয়েন: {channel_users}\n"
-        f"🎯 মোট ট্র্যাক: {total_tracks}\n"
-        f"⏳ সক্রিয় ট্র্যাক: {active_tracks}\n"
-        f"📤 চ্যানেল পোস্ট: {total_channel_posts}\n"
-        f"⏱ চেক ইন্টারভাল: {CHECK_INTERVAL} মিনিট"
-    )
-    
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
-# ========== মেইন ==========
+# ==============================================
+# মেইন ফাংশন
+# ==============================================
 def main():
-    """মেইন ফাংশন"""
-    try:
-        if not all([BOT_TOKEN, CHANNEL_ID, CHANNEL_LINK, MONGO_URI]):
-            raise ValueError("সব environment variables সেট করুন!")
-        
-        app = Application.builder().token(BOT_TOKEN).build()
-        
-        job_queue = app.job_queue
-        if job_queue:
-            job_queue.run_repeating(
-                price_monitor_job,
-                interval=CHECK_INTERVAL * 60,
-                first=10
-            )
-        
-        # ইউজার কমান্ড
-        app.add_handler(CommandHandler("start", start_command))
-        app.add_handler(CommandHandler("mytracks", my_tracks_command))
-        
-        # অ্যাডমিন কমান্ড
-        app.add_handler(CommandHandler("add", admin_add))
-        app.add_handler(CommandHandler("stats", admin_stats))
-        
-        # মেসেজ হ্যান্ডলার
-        app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_track_request
-        ))
-        
-        # কলব্যাক
-        app.add_handler(CallbackQueryHandler(button_callback))
-        
-        logger.info("🚀 ম্যান্ডেটরি চ্যানেল বট চালু হচ্ছে...")
-        print(f"✅ বট চালু হয়েছে! চ্যানেল: {CHANNEL_ID}")
-        print("✅ ইউজারদের চ্যানেল জয়েন করা বাধ্যতামূলক!")
-        
-        app.run_polling(drop_pending_updates=True)
-        
-    except Exception as e:
-        logger.error(f"বট চালু করতে সমস্যা: {e}")
-        raise
+    """বট চালু করুন"""
+    # ফ্লাস্ক সার্ভার চালু করুন
+    keep_alive()
+    print("🌐 ফ্লাস্ক সার্ভার চালু হয়েছে")
+    
+    # বট ইনিশিয়ালাইজ
+    daraz_bot = DarazBot()
+    
+    # Application বিল্ড করুন
+    application = ApplicationBuilder().token(TOKEN).build()
+    
+    # হ্যান্ডলার যোগ করুন
+    application.add_handler(CommandHandler("start", daraz_bot.start))
+    application.add_handler(CommandHandler("mytracks", daraz_bot.list_tracks))
+    application.add_handler(CommandHandler("help", daraz_bot.help))
+    application.add_handler(CommandHandler("stats", daraz_bot.stats))
+    
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, daraz_bot.add_track))
+    application.add_handler(CallbackQueryHandler(daraz_bot.button_handler))
+    
+    # JobQueue সেটআপ - প্রতি ৩০ মিনিট পর প্রাইস চেক করবে
+    job_queue = application.job_queue
+    job_queue.run_repeating(price_checker_job, interval=CHECK_INTERVAL, first=10)
+    
+    print("="*60)
+    print("🤖 দারাজ প্রাইস ট্র্যাকার বট চালু হয়েছে")
+    print(f"📊 চেক ইন্টারভাল: {CHECK_INTERVAL//60} মিনিট")
+    print(f"👥 মোট ইউজার: {users_collection.count_documents({})}")
+    print(f"📦 মোট ট্র্যাক: {tracks_collection.count_documents({})}")
+    print("="*60)
+    
+    # বট চালান
+    application.run_polling()
 
 import os
 from flask import Flask
